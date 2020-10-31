@@ -200,33 +200,58 @@ where
 
         let n = 1 << log_n;
 
-        let mut fft_buffer = self.program.create_buffer::<E::Fr>(n)?;
+        let ta = unsafe {
+            std::mem::transmute::<&mut [E::Fr], &mut [structs::PrimeFieldStruct<E::Fr>]>(a)
+        };
 
-        let max_deg = cmp::min(MAX_LOG2_RADIX, log_n);
-        self.setup_pq_omegas(omega, n, max_deg)?;
+        let max_deg = cmp::min(MAX_RADIX_DEGREE, log_n);
+        self.setup_pq(omega, n, max_deg)?;
 
-        fft_buffer.write_from(&*a)?;
-
-        let kernel = self.program.create_kernel("reverse_bits", n, None);
-        call_kernel!(kernel, &fft_buffer, log_n)?;
+        self.fft_src_buffer.write(&*ta).enq()?;
+        let kernel = self
+            .proque
+            .kernel_builder("reverse_bits")
+            .global_work_size(n)
+            .arg(&self.fft_src_buffer)
+            .arg(log_n)
+            .build()?;
+        unsafe {
+            kernel.enq()?;
+        } // Running a GPU kernel is unsafe!
 
         for log_m in 0..log_n {
-            let kernel = self.program.create_kernel("inplace_fft", n >> 1, None);
-            call_kernel!(kernel, &fft_buffer, &self.omegas_buffer, log_n, log_m)?;
+	        let kernel = self
+                .proque
+                .kernel_builder("inplace_fft")
+                .global_work_size(n >> 1)
+                .arg(&self.fft_src_buffer)
+                .arg(&self.fft_omg_buffer)
+                .arg(log_n)
+                .arg(log_m)
+                .build()?;
+            unsafe {
+                kernel.enq()?;
+            } // Running a GPU kernel is unsafe!
         }
 
-        fft_buffer.read_into(a)?;
+        self.fft_src_buffer.read(ta).enq()?;
 
         Ok(())
     }
 
     pub fn fft(&mut self, a: &mut [E::Fr], omega: &E::Fr, lgn: u32) -> GPUResult<()> {
-        const MIN_RADIX_MEMORY: u64 = 9 * 1024 * 1024 * 1024; // 9GB
-        let mem = self.program.device().memory();
-        if mem > MIN_RADIX_MEMORY {
+        use std::env;
+        let use_inplace_fft = env::var("BELLMAN_USE_INPLACE_FFT")
+            .and_then(|v| match v.parse() {
+                Ok(val) => Ok(val),
+                Err(_) => Ok(0),
+            })
+            .unwrap_or(0);
+
+        if use_inplace_fft == 0 {
             self.radix_fft(a, omega, lgn)
         } else {
-            warn!("FFT: Memory not enough for radix_fft! Using inplace_fft instead...");
+            warn!("FFT: BELLMAN_USE_INPLACE_FFT set! Using inplace_fft instead...");
             self.inplace_fft(a, omega, lgn)
         }
     }
